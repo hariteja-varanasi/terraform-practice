@@ -1,0 +1,72 @@
+#!/bin/bash
+set -euxo pipefail
+exec > >(tee /var/log/user-data.log) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+
+# ---------------------------------------------------------------
+# 1. 4 GB swap file
+# ---------------------------------------------------------------
+if ! swapon --show | grep -q /swapfile; then
+  fallocate -l 4G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+# ---------------------------------------------------------------
+# 2. Format + mount the extra 20 GB EBS volume at /data
+#    The volume is attached by Terraform *after* the instance is created,
+#    so wait for the device to appear (up to ~5 minutes).
+# ---------------------------------------------------------------
+DEV="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${volume_id_nodash}"
+
+for i in $(seq 1 60); do
+  [ -e "$DEV" ] && break
+  sleep 5
+done
+
+if [ -e "$DEV" ]; then
+  blkid "$DEV" || mkfs.ext4 -L data "$DEV"
+  mkdir -p /data
+  grep -q 'LABEL=data' /etc/fstab || echo 'LABEL=data /data ext4 defaults,nofail 0 2' >> /etc/fstab
+  mount -a
+fi
+
+# ---------------------------------------------------------------
+# 3. Install nginx
+# ---------------------------------------------------------------
+apt-get update -y
+apt-get install -y nginx
+
+# ---------------------------------------------------------------
+# 4. Build index.html with the instance id + name (IMDSv2)
+# ---------------------------------------------------------------
+TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-id)
+
+cat > /var/www/html/index.html <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>${instance_name}</title>
+  <style>
+    body { font-family: sans-serif; background: #111; color: #eee;
+           display: flex; align-items: center; justify-content: center;
+           height: 100vh; margin: 0; }
+    h1 { font-size: 1.8rem; }
+    code { color: #7fdbca; }
+  </style>
+</head>
+<body>
+  <h1>hey there handsome! I am <code>$INSTANCE_ID</code> with instance name <code>${instance_name}</code></h1>
+</body>
+</html>
+EOF
+
+systemctl enable --now nginx
+systemctl restart nginx
